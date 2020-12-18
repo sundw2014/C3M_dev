@@ -21,6 +21,8 @@ parser.add_argument('--task', type=str,
                         default='CAR')
 parser.add_argument('--no_cuda', dest='use_cuda', action='store_false')
 parser.set_defaults(use_cuda=True)
+parser.add_argument('--u_only', dest='u_only', action='store_true')
+parser.set_defaults(u_only=False)
 parser.add_argument('--bs', type=int, default=1024)
 parser.add_argument('--num_train', type=int, default=131072) # 4096 * 32
 parser.add_argument('--num_test', type=int, default=32768) # 1024 * 32
@@ -28,9 +30,12 @@ parser.add_argument('--lr', dest='learning_rate', type=float, default=0.001)
 parser.add_argument('--epochs', type=int, default=15)
 parser.add_argument('--lr_step', type=int, default=5)
 parser.add_argument('--lambda', type=float, dest='_lambda', default=0.5)
+parser.add_argument('--epsilon', type=float, dest='epsilon', default=0.05)
 parser.add_argument('--w_ub', type=float, default=10)
 parser.add_argument('--w_lb', type=float, default=0.1)
 parser.add_argument('--log', type=str)
+parser.add_argument('--pretrained', type=str)
+parser.add_argument('--pretrained_sysid', type=str)
 
 args = parser.parse_args()
 
@@ -39,7 +44,8 @@ os.system('cp -r models/ '+args.log)
 os.system('cp -r configs/ '+args.log)
 os.system('cp -r systems/ '+args.log)
 
-epsilon = args._lambda * 0.1
+# epsilon = args._lambda * 0.1
+epsilon = args.epsilon
 
 config = importlib.import_module('config_'+args.task)
 X_MIN = config.X_MIN
@@ -57,10 +63,24 @@ num_dim_control = system.num_dim_control
 if hasattr(system, 'Bbot_func'):
     Bbot_func = system.Bbot_func
 
+# rewrite f_func with the learned one
+if args.pretrained_sysid:
+    model_sysid = importlib.import_module('model_sysid')
+    model_fhat, f_func = model_sysid.get_model(num_dim_x, use_cuda=args.use_cuda)
+    ck = torch.load(args.pretrained_sysid)
+    model_fhat.load_state_dict(ck['model_fhat'])
+
 model = importlib.import_module('model_'+args.task)
 get_model = model.get_model
 
 model_W, model_Wbot, model_u_w1, model_u_w2, W_func, u_func = get_model(num_dim_x, num_dim_control, w_lb=args.w_lb, use_cuda=args.use_cuda)
+
+if args.pretrained is not None:
+    ck = torch.load(args.pretrained)
+    model_W.load_state_dict(ck['model_W'])
+    model_Wbot.load_state_dict(ck['model_Wbot'])
+    model_u_w1.load_state_dict(ck['model_u_w1'])
+    model_u_w2.load_state_dict(ck['model_u_w2'])
 
 # constructing datasets
 def sample_xef():
@@ -206,7 +226,12 @@ def forward(x, xref, uref, _lambda, verbose=False, acc=False, detach=False):
     else:
         return loss, None, None, None
 
-optimizer = torch.optim.Adam(list(model_W.parameters()) + list(model_Wbot.parameters()) + list(model_u_w1.parameters()) + list(model_u_w2.parameters()), lr=args.learning_rate)
+    
+param_list = list(model_u_w1.parameters()) + list(model_u_w2.parameters())
+if not args.u_only:
+    param_list += (list(model_W.parameters()) + list(model_Wbot.parameters()))
+
+optimizer = torch.optim.Adam(param_list, lr=args.learning_rate)
 
 def trainval(X, bs=args.bs, train=True, _lambda=args._lambda, acc=False, detach=False): # trainval a set of x
     # torch.autograd.set_detect_anomaly(True)
@@ -270,7 +295,7 @@ def adjust_learning_rate(optimizer, epoch):
 
 for epoch in range(args.epochs):
     adjust_learning_rate(optimizer, epoch)
-    loss, _, _, _ = trainval(X_tr, train=True, _lambda=args._lambda, acc=False, detach=True if epoch < args.lr_step else False)
+    loss, _, _, _ = trainval(X_tr, train=True, _lambda=args._lambda, acc=False, detach=True if (epoch < args.lr_step and not args.u_only) else False)
     print("Training loss: ", loss)
     loss, p1, p2, l3 = trainval(X_te, train=False, _lambda=0., acc=True, detach=False)
     print("Epoch %d: Testing loss/p1/p2/l3: "%epoch, loss, p1, p2, l3)
